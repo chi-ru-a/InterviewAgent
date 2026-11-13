@@ -1,0 +1,55 @@
+spring:
+  application:
+    name: interview-agent
+  profiles:
+    active: dev
+
+  # Spring AI 通用配置（不含模型，模型在 profile 中指定）
+  ai:
+    retry:
+      max-attempts: 10
+      backoff:
+        initial-interval: 3s
+        multiplier: 2
+        max-interval: 120s
+      on-http-codes: 429, 500, 502, 503
+
+  # 静态资源处理
+  web:
+    resources:
+      add-mappings: true
+
+# MyBatis-Plus 配置
+mybatis-plus:
+  mapper-locations: classpath*:mapper/**/*.xml
+  type-aliases-package: com.zunff.agent.model.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.slf4j.Slf4jImpl
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+server:
+  port: ${SERVER_PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+# 面试系统配置
+interview:
+  prompt:
+    response-language: zh-CN     # Candidate-facing output language
+  video:
+    analysis-interval: 5000      # 视频分析间隔(ms)
+    max-frames-per-analysis: 10  # 每次分析最大帧数
+

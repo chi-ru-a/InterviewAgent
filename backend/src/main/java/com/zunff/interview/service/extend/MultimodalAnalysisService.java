@@ -1,0 +1,448 @@
+package com.zunff.interview.service.extend;
+
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
+import cn.hutool.json.JSONUtil;
+import com.zunff.interview.config.PromptConfig;
+import com.zunff.interview.model.bo.EvaluationBO;
+import com.zunff.interview.model.bo.FollowUpChainEntity;
+import com.zunff.interview.model.bo.GeneratedQuestion;
+import com.zunff.interview.model.bo.analysis.FrameWithTimestamp;
+import com.zunff.interview.model.bo.analysis.TranscriptEntry;
+import com.zunff.interview.model.dto.llm.vars.FollowUpRoutePromptVars;
+import com.zunff.interview.model.dto.llm.resp.EvaluationResponseDto;
+import com.zunff.interview.model.dto.llm.resp.FollowUpRouteDecisionDto;
+import com.zunff.interview.utils.JsonExtractionUtils;
+import com.zunff.interview.utils.OmniOverallScoreUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * 多模态分析服务
+ * 核心方法：comprehensiveOmniEvaluation() — 一次 Omni 调用综合评估
+ * 辅助方法：decideFollowUpRoute() — 基于评估结果进行路由决策（只返回路由，不生成问题）
+ *
+ * 模型分工：
+ * - omniModalService (qwen3.5-omni-plus): Omni 多模态综合评估（视频帧+音频+文本）
+ * - textChatClient (qwen3.5-plus): 追问决策等文本任务
+ */
+@Slf4j
+public class MultimodalAnalysisService {
+
+    private final ChatClient textChatClient;
+    private final OmniModalService omniModalService;
+    private final PromptTemplateService promptTemplateService;
+    private final PromptConfig promptConfig;
+    private final boolean multimodalEnabled;
+
+    public MultimodalAnalysisService(ChatClient textChatClient,
+                                      OmniModalService omniModalService,
+                                      PromptTemplateService promptTemplateService,
+                                      PromptConfig promptConfig,
+                                      boolean multimodalEnabled) {
+        this.textChatClient = textChatClient;
+        this.omniModalService = omniModalService;
+        this.promptTemplateService = promptTemplateService;
+        this.promptConfig = promptConfig;
+        this.multimodalEnabled = multimodalEnabled;
+    }
+
+    // ========== 核心方法 ==========
+
+    /**
+     * Omni 多模态综合评估（一次性调用）
+     * 将转录文本+时间戳、视频帧+时间戳、原始音频WAV一起发给 Qwen-Omni 进行综合评估
+     * 当 multimodalEnabled=false 时，降级为纯文本评估（qwen-plus）
+     *
+     * @param questionIndex         问题索引
+     * @param question              当前问题
+     * @param transcribedText       转录文本
+     * @param transcriptEntries     转录条目（带时间戳）
+     * @param framesWithTimestamps  视频帧（带时间戳）
+     * @param base64WavAudio        WAV音频（Base64编码）
+     * @param evaluationPromptName  评估Prompt模板名称
+     * @param generatedQuestion     题目元信息（包含难度、期望关键词等）
+     * @return 综合评估结果
+     */
+    public EvaluationBO comprehensiveOmniEvaluation(
+            int questionIndex,
+            String question,
+            String transcribedText,
+            List<TranscriptEntry> transcriptEntries,
+            List<FrameWithTimestamp> framesWithTimestamps,
+            String base64WavAudio,
+            String evaluationPromptName,
+            GeneratedQuestion generatedQuestion) {
+
+        boolean hasFrames = framesWithTimestamps != null && !framesWithTimestamps.isEmpty();
+        boolean hasAudio = base64WavAudio != null && !base64WavAudio.isEmpty();
+
+        log.info("开始综合评估，multimodalEnabled={}, 视频帧: {}, 音频: {}, 转录条目: {}",
+                multimodalEnabled,
+                hasFrames ? framesWithTimestamps.size() : 0,
+                hasAudio ? "有" : "无",
+                transcriptEntries != null ? transcriptEntries.size() : 0);
+
+        // multimodalEnabled=false 或无任何多模态数据时，降级为纯文本评估
+        if (!multimodalEnabled || (!hasFrames && !hasAudio)) {
+            log.info("多模态未启用或无多模态数据，使用纯文本评估");
+            return textOnlyEvaluation(question, transcribedText, evaluationPromptName, generatedQuestion);
+        }
+
+        try {
+            // 加载评估模板
+            String systemPrompt = promptTemplateService.getPrompt("evaluation-omni-" + evaluationPromptName);
+
+            // 构建提示词变量，包含题目元信息
+            Map<String, Object> promptVars = new HashMap<>();
+            promptVars.put("question", question == null ? "" : question);
+            promptVars.put("candidateAnswer", formatTranscriptEntries(transcriptEntries, transcribedText));
+            promptVars.put("frameTimestamps", hasFrames ? formatFrameTimestamps(framesWithTimestamps) : "无关键帧时间戳");
+            promptVars.put("responseLanguage", promptConfig.getResponseLanguage());
+
+            // 添加题目元信息
+            fillEvaluationPromptVars(generatedQuestion, promptVars);
+
+            String userPrompt = promptTemplateService.getPrompt("omni-evaluation-user", promptVars);
+
+            // 3. 提取纯帧数据用于 Omni 调用
+            List<String> base64Frames = framesWithTimestamps.stream()
+                    .map(FrameWithTimestamp::getFrame)
+                    .toList();
+
+            // 4. 调用 OmniModalService 进行多模态综合分析
+            String response = omniModalService.analyzeMultimodal(base64Frames, base64WavAudio, systemPrompt, userPrompt);
+
+            // 5. 解析返回的 JSON
+            EvaluationBO evaluation = parseOmniEvaluationResponse(response);
+            evaluation.setQuestionIndex(questionIndex);
+            evaluation.setQuestion(question);
+            evaluation.setAnswer(transcribedText);
+
+            // 6. 关联 GeneratedQuestion
+            evaluation.setGeneratedQuestion(generatedQuestion);
+
+            return evaluation;
+
+        } catch (Exception e) {
+            log.error("Omni多模态综合评估失败", e);
+            throw new RuntimeException("Omni多模态综合评估失败", e);
+        }
+    }
+
+    /**
+     * 纯文本评估（降级方案）
+     * 使用 qwen-plus 文本模型进行评估，多模态分数字段返回默认值
+     */
+    private EvaluationBO textOnlyEvaluation(String question, String transcribedText, String evaluationPromptName, GeneratedQuestion generatedQuestion) {
+        try {
+            // 加载评估模板
+            String systemPrompt = promptTemplateService.getPrompt("evaluation-omni-" + evaluationPromptName);
+
+            // 构建提示词变量，包含题目元信息
+            Map<String, Object> promptVars = new HashMap<>();
+            promptVars.put("question", question == null ? "" : question);
+            promptVars.put("candidateAnswer", transcribedText == null ? "" : transcribedText);
+            promptVars.put("responseLanguage", promptConfig.getResponseLanguage());
+
+            // 添加题目元信息
+            fillEvaluationPromptVars(generatedQuestion, promptVars);
+
+            String userPrompt = promptTemplateService.getPrompt("omni-text-evaluation-user", promptVars);
+
+            EvaluationResponseDto response = textChatClient.prompt()
+                    .system(systemPrompt)
+                    .user(userPrompt)
+                    .call()
+                    .entity(EvaluationResponseDto.class);
+
+            EvaluationBO evaluation = toEvaluationBO(response);
+
+            // 关联 GeneratedQuestion
+            evaluation.setGeneratedQuestion(generatedQuestion);
+
+            return evaluation;
+
+        } catch (Exception e) {
+            log.error("纯文本评估失败", e);
+            throw new RuntimeException("纯文本评估失败", e);
+        }
+    }
+
+    private void fillEvaluationPromptVars(GeneratedQuestion generatedQuestion, Map<String, Object> promptVars) {
+        if (generatedQuestion != null) {
+            promptVars.put("difficulty", generatedQuestion.getDifficulty() != null ? generatedQuestion.getDifficulty() : "medium");
+            promptVars.put("expectedKeywords", generatedQuestion.getExpectedKeywords() != null ? String.join(", ", generatedQuestion.getExpectedKeywords()) : "No specific keywords");
+            promptVars.put("reason", generatedQuestion.getReason() != null ? generatedQuestion.getReason() : "No specific intention stated");
+        } else {
+            promptVars.put("difficulty", "medium");
+            promptVars.put("expectedKeywords", "No specific keywords");
+            promptVars.put("reason", "No specific intention stated");
+        }
+    }
+
+    /**
+     * 追问路由决策（只返回路由，不生成问题）
+     *
+     * @param evaluation        评估结果
+     * @param generatedQuestion 题目元信息（包含 difficulty、expectedKeywords）
+     * @param followUpCount     已追问次数
+     * @param maxFollowUps      追问上限
+     * @return 路由决策（followUp / deepDive / challengeMode / nextQuestion）
+     */
+    public String decideFollowUpRoute(
+            EvaluationBO evaluation,
+            GeneratedQuestion generatedQuestion,
+            int followUpCount,
+            int maxFollowUps,
+            List<FollowUpChainEntity> followUpChain) {
+
+        log.info("开始LLM路由决策，当前追问次数: {}/{}", followUpCount, maxFollowUps);
+
+        FollowUpRoutePromptVars vars = buildFollowUpRoutePromptVars(
+                evaluation, generatedQuestion, followUpCount, maxFollowUps, followUpChain);
+        Map<String, Object> promptVars = vars.asMap();
+
+        try {
+            String systemPrompt = promptTemplateService.getPrompt("followup-route-decision", promptVars);
+            String userPrompt = promptTemplateService.getPrompt("followup-route-decision-user", promptVars);
+
+            FollowUpRouteDecisionDto response = textChatClient.prompt()
+                    .system(systemPrompt)
+                    .user(userPrompt)
+                    .call()
+                    .entity(FollowUpRouteDecisionDto.class);
+
+            String decision = response.decision();
+            log.info("LLM路由决策结果: {}, 原因: {}", decision, response.reason());
+            return decision;
+
+        } catch (Exception e) {
+            log.error("LLM路由决策失败", e);
+            return "nextQuestion"; // 失败时默认进入下一题
+        }
+    }
+
+    private FollowUpRoutePromptVars buildFollowUpRoutePromptVars(
+            EvaluationBO evaluation,
+            GeneratedQuestion generatedQuestion,
+            int followUpCount,
+            int maxFollowUps,
+            List<FollowUpChainEntity> followUpChain) {
+
+        int remainingFollowUps = maxFollowUps - followUpCount;
+
+        String questionText = evaluation.getQuestion();
+        if (questionText == null && generatedQuestion != null) {
+            questionText = generatedQuestion.getQuestion();
+        }
+
+        String answerText = evaluation.getAnswer();
+
+        String difficulty = "medium";
+        String expectedKeywords = "No specific keywords";
+        String questionIntent = "No specific intention stated";
+
+        if (generatedQuestion != null) {
+            difficulty = generatedQuestion.getDifficulty() != null ? generatedQuestion.getDifficulty() : "medium";
+            expectedKeywords = generatedQuestion.getExpectedKeywords() != null
+                    ? String.join(", ", generatedQuestion.getExpectedKeywords())
+                    : "No specific keywords";
+            questionIntent = generatedQuestion.getReason() != null ? generatedQuestion.getReason() : "No specific intention stated";
+        }
+
+        // 构建追问历史字符串（最近2次）
+        String followUpHistory = buildFollowUpHistory(followUpChain);
+
+        return FollowUpRoutePromptVars.builder()
+                .responseLanguage(promptConfig.getResponseLanguage())
+                .overallScore(evaluation.getOverallScore())
+                .accuracy(evaluation.getAccuracy())
+                .logic(evaluation.getLogic())
+                .fluency(evaluation.getFluency())
+                .confidence(evaluation.getConfidence())
+                .emotionScore(evaluation.getEmotionScore())
+                .bodyLanguageScore(evaluation.getBodyLanguageScore())
+                .voiceToneScore(evaluation.getVoiceToneScore())
+                .modalityConcern(evaluation.isModalityConcern())
+                .question(questionText != null ? questionText : "")
+                .answer(answerText != null ? answerText : "")
+                .difficulty(difficulty)
+                .expectedKeywords(expectedKeywords)
+                .questionIntent(questionIntent)
+                .strengths(evaluation.getStrengths() != null ? String.join(", ", evaluation.getStrengths()) : "")
+                .weaknesses(evaluation.getWeaknesses() != null ? String.join(", ", evaluation.getWeaknesses()) : "")
+                .detailedEvaluation(evaluation.getDetailedEvaluation() != null ? evaluation.getDetailedEvaluation() : "")
+                .followUpCount(followUpCount)
+                .maxFollowUps(maxFollowUps)
+                .remainingFollowUps(remainingFollowUps)
+                .followUpHistory(followUpHistory)
+                .build();
+    }
+
+    /**
+     * 构建追问历史字符串（最近2次）
+     */
+    private String buildFollowUpHistory(List<FollowUpChainEntity> followUpChain) {
+        if (followUpChain == null || followUpChain.isEmpty()) {
+            return "No previous follow-ups";
+        }
+
+        // 取最近2次追问
+        int start = Math.max(0, followUpChain.size() - 2);
+        StringBuilder history = new StringBuilder();
+
+        for (int i = start; i < followUpChain.size(); i++) {
+            FollowUpChainEntity entity = followUpChain.get(i);
+            int index = i - start + 1;
+
+            history.append(String.format("Follow-up %d:\n", index));
+            history.append(String.format("  Score: %d\n",
+                    entity.getOverallScore() != null ? entity.getOverallScore() : 0));
+
+            if (i > start) {
+                // 计算分数变化
+                FollowUpChainEntity prevEntity = followUpChain.get(i - 1);
+                int prevScore = prevEntity.getOverallScore() != null ? prevEntity.getOverallScore() : 0;
+                int currentScore = entity.getOverallScore() != null ? entity.getOverallScore() : 0;
+                int change = currentScore - prevScore;
+                history.append(String.format("  Score change: %+d\n", change));
+            }
+
+            if (i == followUpChain.size() - 1) {
+                history.append("\n");
+            }
+        }
+
+        return history.toString().trim();
+    }
+
+    // ========== 解析方法 ==========
+
+    /**
+     * 解析 Omni 多模态评估响应
+     */
+    private EvaluationBO parseOmniEvaluationResponse(String response) {
+        try {
+            String jsonStr = JsonExtractionUtils.extractJsonObjectString(response);
+            JSONObject json = JSONUtil.parseObj(jsonStr);
+
+            // 提取多模态分数字段
+            int emotionScore = json.getInt("emotionScore", 70);
+            int bodyLanguageScore = json.getInt("bodyLanguageScore", 70);
+            int voiceToneScore = json.getInt("voiceToneScore", 70);
+
+            int accuracy = json.getInt("accuracy", 70);
+            int logic = json.getInt("logic", 70);
+            int fluency = json.getInt("fluency", 70);
+            int confidence = json.getInt("confidence", 70);
+
+            int overallScore = OmniOverallScoreUtils.computeOverallScore(
+                    accuracy, logic, fluency, confidence, emotionScore, bodyLanguageScore, voiceToneScore);
+
+            return EvaluationBO.builder()
+                    .accuracy(accuracy)
+                    .logic(logic)
+                    .fluency(fluency)
+                    .confidence(confidence)
+                    .emotionScore(emotionScore)
+                    .bodyLanguageScore(bodyLanguageScore)
+                    .voiceToneScore(voiceToneScore)
+                    .overallScore(overallScore)
+                    .strengths(parseStringList(json, "strengths"))
+                    .weaknesses(parseStringList(json, "weaknesses"))
+                    .detailedEvaluation(json.getStr("detailedEvaluation", ""))
+                    .standardAnswer(json.getStr("standardAnswer", ""))
+                    .suggestions(json.getStr("suggestions", ""))
+                    .modalityConcern(emotionScore < 60 || bodyLanguageScore < 60 || voiceToneScore < 60)
+                    .build();
+
+        } catch (Exception e) {
+            log.error("解析Omni评估结果失败: {}", e.getMessage());
+            int fallbackOverall = OmniOverallScoreUtils.computeOverallScore(60, 60, 60, 60, 70, 70, 70);
+            return EvaluationBO.builder()
+                    .accuracy(60).logic(60).fluency(60).confidence(60)
+                    .emotionScore(70).bodyLanguageScore(70).voiceToneScore(70)
+                    .overallScore(fallbackOverall)
+                    .build();
+        }
+    }
+
+    private EvaluationBO toEvaluationBO(EvaluationResponseDto response) {
+        if (response == null) {
+            int fallbackOverall = OmniOverallScoreUtils.computeOverallScore(60, 60, 60, 60, 70, 70, 70);
+            return EvaluationBO.builder()
+                    .accuracy(60).logic(60).fluency(60).confidence(60)
+                    .emotionScore(70).bodyLanguageScore(70).voiceToneScore(70)
+                    .overallScore(fallbackOverall)
+                    .build();
+        }
+        int emotionScore = response.emotionScore() == null ? 70 : response.emotionScore();
+        int bodyLanguageScore = response.bodyLanguageScore() == null ? 70 : response.bodyLanguageScore();
+        int voiceToneScore = response.voiceToneScore() == null ? 70 : response.voiceToneScore();
+        int accuracy = response.accuracy() == null ? 70 : response.accuracy();
+        int logic = response.logic() == null ? 70 : response.logic();
+        int fluency = response.fluency() == null ? 70 : response.fluency();
+        int confidence = response.confidence() == null ? 70 : response.confidence();
+        int overallScore = OmniOverallScoreUtils.computeOverallScore(
+                accuracy, logic, fluency, confidence, emotionScore, bodyLanguageScore, voiceToneScore);
+        return EvaluationBO.builder()
+                .accuracy(accuracy)
+                .logic(logic)
+                .fluency(fluency)
+                .confidence(confidence)
+                .emotionScore(emotionScore)
+                .bodyLanguageScore(bodyLanguageScore)
+                .voiceToneScore(voiceToneScore)
+                .overallScore(overallScore)
+                .strengths(response.strengths() == null ? List.of() : response.strengths())
+                .weaknesses(response.weaknesses() == null ? List.of() : response.weaknesses())
+                .detailedEvaluation(response.detailedEvaluation() == null ? "" : response.detailedEvaluation())
+                .standardAnswer(response.standardAnswer() == null ? "" : response.standardAnswer())
+                .suggestions(response.suggestions() == null ? "" : response.suggestions())
+                .modalityConcern(emotionScore < 60 || bodyLanguageScore < 60 || voiceToneScore < 60)
+                .build();
+    }
+
+
+    private List<String> parseStringList(JSONObject json, String key) {
+        List<String> result = new ArrayList<>();
+        JSONArray array = json.getJSONArray(key);
+        if (array != null && !array.isEmpty()) {
+            for (int i = 0; i < array.size(); i++) {
+                result.add(array.getStr(i));
+            }
+        }
+        return result;
+    }
+
+    private String formatTranscriptEntries(List<TranscriptEntry> transcriptEntries, String transcribedText) {
+        if (transcriptEntries != null && !transcriptEntries.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+            for (TranscriptEntry entry : transcriptEntries) {
+                builder.append(String.format("[%d-%d] %s%n",
+                        entry.getStartTimeMs(),
+                        entry.getEndTimeMs(),
+                        entry.getText()));
+            }
+            return builder.toString().trim();
+        }
+        return transcribedText == null ? "" : transcribedText;
+    }
+
+    private String formatFrameTimestamps(List<FrameWithTimestamp> framesWithTimestamps) {
+        if (framesWithTimestamps == null || framesWithTimestamps.isEmpty()) {
+            return "无关键帧时间戳";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (FrameWithTimestamp frame : framesWithTimestamps) {
+            builder.append("- 帧时间戳: ").append(frame.getTimestampMs()).append("ms").append(System.lineSeparator());
+        }
+        return builder.toString().trim();
+    }
+}

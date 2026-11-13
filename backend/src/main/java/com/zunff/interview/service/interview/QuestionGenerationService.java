@@ -1,0 +1,246 @@
+package com.zunff.interview.service.interview;
+
+import com.zunff.interview.agent.state.BatchQuestionGenState;
+import com.zunff.interview.config.KnowledgeConfig;
+import com.zunff.interview.config.PromptConfig;
+import com.zunff.interview.constant.Difficulty;
+import com.zunff.interview.constant.DifficultyPreference;
+import com.zunff.interview.constant.QuestionType;
+import com.zunff.interview.model.bo.GeneratedQuestion;
+import com.zunff.interview.model.bo.JobAnalysisResult;
+import com.zunff.interview.model.bo.LevelMatchResult;
+import com.zunff.interview.model.dto.llm.resp.LlmQuestionListResultDto;
+import com.zunff.interview.model.dto.llm.resp.QuestionPlanResponseDto;
+import com.zunff.interview.model.dto.llm.vars.QuestionGeneratorUserPromptVars;
+import com.zunff.interview.model.dto.rag.KnowledgeSearchResult;
+import com.zunff.interview.service.extend.PromptTemplateService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * 题目生成服务
+ * 负责批量生成指定类型的面试题目
+ *
+ * 功能：
+ * - 根据题目类型和数量生成面试题目
+ * - 支持知识库检索参考题目
+ * - 支持降级处理（生成默认题目）
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class QuestionGenerationService {
+
+    private final ChatClient textChatClient;
+    private final PromptTemplateService promptTemplateService;
+    private final PromptConfig promptConfig;
+    private final InterviewKnowledgeService knowledgeService;
+    private final KnowledgeConfig knowledgeConfig;
+
+    /**
+     * 批量生成指定类型的题目
+     *
+     * @param state 包含题目类型、数量等配置的状态对象
+     * @return 生成结果，包含题目列表
+     */
+    public CompletableFuture<Map<String, Object>> execute(BatchQuestionGenState state, int count, QuestionType questionType, String outputKey) {
+        log.info("批量生成 {} 题目，数量: {}", questionType.getDisplayName(), count);
+
+        if (count <= 0) {
+            log.info("{} 题目数量为 0，跳过生成", questionType.getDisplayName());
+            return CompletableFuture.completedFuture(Map.of(outputKey, new ArrayList<GeneratedQuestion>()));
+        }
+
+        try {
+            String candidateProfile = state.candidateProfile();
+            String jobContext = state.getJobContext();
+
+            LevelMatchResult levelMatch = state.levelMatchResult();
+            String positionLevel = levelMatch != null ? levelMatch.positionLevel().getDescription() : JobAnalysisResult.PositionLevel.MID_LEVEL.getDescription();
+            String candidateLevel = levelMatch != null ? levelMatch.candidateLevel().getDescription() : JobAnalysisResult.PositionLevel.MID_LEVEL.getDescription();
+            String difficultyRangeMin = levelMatch != null ? levelMatch.difficultyRangeMin().getCode() : Difficulty.EASY.getCode();
+            String difficultyRangeMax = levelMatch != null ? levelMatch.difficultyRangeMax().getCode() : Difficulty.HARD.getCode();
+            String difficultyPreference = levelMatch != null ? levelMatch.difficultyPreference().getCode() : DifficultyPreference.STANDARD.getCode();
+
+            // 从知识库检索参考题目(仅在知识库启用且公司信息存在时)
+            String referenceContext = "";
+            boolean shouldSearchKnowledge = knowledgeConfig.isEnabled()
+                    && state.knowledgeCompany() != null
+                    && !state.knowledgeCompany().isBlank();
+
+            if (shouldSearchKnowledge) {
+                referenceContext = searchReferenceQuestions(jobContext, state, questionType);
+            } else if (knowledgeConfig.isEnabled()) {
+                log.info("知识库已启用，但公司信息为空，跳过知识库检索");
+            }
+
+            String promptTemplateName = "question-generator-" + questionType.getEvaluationPrompt();
+            Map<String, Object> systemVars = new HashMap<>();
+            systemVars.put("responseLanguage", promptConfig.getResponseLanguage());
+            systemVars.put("count", count);
+            systemVars.put("positionLevel", positionLevel);
+            systemVars.put("candidateLevel", candidateLevel);
+            systemVars.put("difficultyRangeMin", difficultyRangeMin);
+            systemVars.put("difficultyRangeMax", difficultyRangeMax);
+            systemVars.put("difficultyPreference", difficultyPreference);
+            String systemPrompt = promptTemplateService.getPrompt(promptTemplateName, systemVars);
+
+            // 从规划节点获取话题分配（如有）
+            String planContext = buildPlanContext(state, promptTemplateName);
+
+            // 构建 user prompt
+            QuestionGeneratorUserPromptVars vars = QuestionGeneratorUserPromptVars.builder()
+                    .candidateProfile(candidateProfile == null ? "" : candidateProfile)
+                    .jobInfo(jobContext == null ? "" : jobContext)
+                    .roundDisplayName(questionType.getDisplayName())
+                    .count(count)
+                    .referenceContext(referenceContext.isBlank() ? "None" : referenceContext)
+                    .responseLanguage(promptConfig.getResponseLanguage())
+                    .positionLevel(positionLevel)
+                    .candidateLevel(candidateLevel)
+                    .difficultyRangeMin(difficultyRangeMin)
+                    .difficultyRangeMax(difficultyRangeMax)
+                    .difficultyPreference(difficultyPreference)
+                    .planContext(planContext)
+                    .build();
+            String userPrompt = promptTemplateService.getPrompt("question-generator-user", vars.asMap());
+
+
+            // 总是使用列表解析
+            LlmQuestionListResultDto response = textChatClient.prompt()
+                    .system(systemPrompt)
+                    .user(userPrompt)
+                    .call()
+                    .entity(LlmQuestionListResultDto.class);
+
+            List<GeneratedQuestion> questions = parseQuestionList(response, questionType, count);
+
+            log.info("批量生成 {} 题目成功，实际生成: {}", questionType.getDisplayName(), questions.size());
+
+            return CompletableFuture.completedFuture(Map.of(outputKey, questions));
+
+        } catch (Exception e) {
+            log.error("批量生成 {} 题目失败", questionType.getDisplayName(), e);
+            // 降级：返回默认题目
+            List<GeneratedQuestion> fallbackQuestions = generateFallbackQuestions(count, questionType);
+            return CompletableFuture.completedFuture(Map.of(outputKey, fallbackQuestions));
+        }
+    }
+
+    /**
+     * 从知识库检索参考题目
+     */
+    private String searchReferenceQuestions(String jobContext, BatchQuestionGenState state, QuestionType questionType) {
+        try {
+            List<KnowledgeSearchResult> results = knowledgeService.searchByJobInfo(
+                    jobContext,
+                    questionType.getDisplayName(),
+                    state.knowledgeCompany(),
+                    state.knowledgeJobPosition(),
+                    5  // 批量生成时多检索一些参考
+            );
+
+            if (results.isEmpty()) {
+                return "";
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < results.size(); i++) {
+                KnowledgeSearchResult r = results.get(i);
+                sb.append(i + 1).append(". ").append(r.getQuestion()).append("\n");
+                if (r.getCompany() != null && !r.getCompany().isEmpty()) {
+                    sb.append("   公司：").append(r.getCompany()).append("\n");
+                }
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            log.warn("知识库检索失败: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * 解析 LLM 返回的题目列表
+     */
+    private List<GeneratedQuestion> parseQuestionList(LlmQuestionListResultDto response, QuestionType questionType, int expectedCount) {
+        if (response == null || response.getQuestions() == null || response.getQuestions().isEmpty()) {
+            return generateFallbackQuestions(expectedCount, questionType);
+        }
+
+        List<GeneratedQuestion> questions = new ArrayList<>();
+        int index = 1;
+        for (LlmQuestionListResultDto.QuestionDto dto : response.getQuestions()) {
+            GeneratedQuestion question = GeneratedQuestion.builder()
+                    .question(dto.getQuestion() == null || dto.getQuestion().isBlank()
+                            ? buildFallbackQuestionText()
+                            : dto.getQuestion())
+                    .questionType(questionType.getDisplayName())
+                    .expectedKeywords(dto.getExpectedKeywords() == null ? List.of() : dto.getExpectedKeywords())
+                    .difficulty(dto.getDifficulty() == null || dto.getDifficulty().isBlank() ? "medium" : dto.getDifficulty())
+                    .reason(dto.getReason() == null ? "" : dto.getReason())
+                    .questionIndex(index++)
+                    .build();
+            questions.add(question);
+        }
+
+        // 如果生成数量不足，补充默认题目
+        while (questions.size() < expectedCount) {
+            questions.add(createFallbackQuestion(questions.size() + 1, questionType));
+        }
+
+        return questions;
+    }
+
+    private GeneratedQuestion createFallbackQuestion(int index, QuestionType questionType) {
+        return GeneratedQuestion.builder()
+                .question(buildFallbackQuestionText())
+                .questionType(questionType.getDisplayName())
+                .expectedKeywords(List.of())
+                .difficulty("medium")
+                .reason("Fallback question due to generation failure")
+                .questionIndex(index)
+                .build();
+    }
+
+    private List<GeneratedQuestion> generateFallbackQuestions(int count, QuestionType questionType) {
+        List<GeneratedQuestion> questions = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            questions.add(createFallbackQuestion(i + 1, questionType));
+        }
+        return questions;
+    }
+
+    /**
+     * 从规划节点结果中构建指定题型的计划上下文
+     */
+    private String buildPlanContext(BatchQuestionGenState state, String promptTemplateName) {
+        QuestionPlanResponseDto plan = state.getQuestionPlan();
+        if (plan == null) {
+            return "None (no plan provided)";
+        }
+
+        // promptTemplateName 格式: "question-generator-technical" → 提取 "technical"
+        String typeKey = promptTemplateName.replace("question-generator-", "");
+        String context = plan.getPlanContextForType(typeKey);
+        if (context == null || context.isEmpty()) {
+            return "None (no plan for this type)";
+        }
+        return context;
+    }
+
+    private String buildFallbackQuestionText() {
+        String language = promptConfig.getResponseLanguage();
+        if (language != null && language.toLowerCase().startsWith("zh")) {
+            return "请简单介绍一下你的技术背景和项目经验。";
+        }
+        return "Could you briefly introduce your technical background and project experience?";
+    }
+}

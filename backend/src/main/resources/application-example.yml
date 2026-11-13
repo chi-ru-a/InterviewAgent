@@ -1,0 +1,75 @@
+# 示例配置文件
+# 复制此文件为 application-dev.yml 并填入您的实际配置
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/interview_agent
+    username: interview
+    password: interview123
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      idle-timeout: 300000
+      connection-timeout: 20000
+
+  # Spring AI 模型配置（使用 OpenAI 兼容 API）
+  ai:
+    openai:
+      # OpenAI 兼容 API
+      api-key: ${OPENAI_API_KEY}
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      chat:
+        completions-path: /chat/completions
+        options:
+          model: qwen3.5-flash
+          temperature: 0.7
+      embedding:
+        options:
+          model: text-embedding-v3
+    # 向量存储配置 (pgvector)
+    vectorstore:
+      pgvector:
+        index-type: HNSW
+        distance-type: COSINE_DISTANCE
+        dimensions: 1024
+        initialize-schema: true
+    # 聊天记忆配置 (JDBC)
+    chat:
+      memory:
+        repository:
+          jdbc:
+            initialize-schema: true
+
+interview:
+  graph:
+    main-recursion-limit: 500
+  multimodal:
+    api-key: ${DASHSCOPE_API_KEY}
+    enabled: true                # 是否启用多模态分析
+    omni:
+      model: qwen3.5-omni-plus-2026-03-15
+    # ASR 实时语音识别配置（DashScope SDK + fun-asr-realtime）
+    asr:
+      model: fun-asr-realtime-2026-02-28
+      language: zh
+      input-audio-format: pcm
+      sample-rate: 16000
+      # 热词表ID（需在阿里云百炼平台创建热词表后填入）
+      # 创建方式：https://help.aliyun.com/zh/model-studio/custom-hot-words/
+      # 建议热词内容参考 docs/asr-vocabulary.txt
+      vocabulary-id:
+  tts:
+    enabled: true                # 是否启用语音提问
+    model: qwen3-tts-instruct-flash-realtime-2026-01-22
+    voice: Ethan
+  knowledge:
+    enabled: true                # 是否启用知识库检索
+
+# 日志级别
+logging:
+  level:
+    root: INFO
+    # 查看 Spring AI HTTP 请求详情（开发调试时开启）
+    # org.springframework.ai: DEBUG
+    # org.springframework.web.client: DEBUG
